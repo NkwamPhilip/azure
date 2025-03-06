@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-
 """
 azure_mriqc_server.py
 
 This Flask API receives a POST request with:
-  - 'bids_zip': A zip file containing a BIDS dataset
-  - 'participant_label': (optional) subject ID (default: '01')
+  - 'bids_zip': A zip file containing a BIDS dataset.
+  - 'participant_label': (optional) subject ID (default: '01').
 
-It unzips the data, finds the first directory, assumes it's the BIDS root,
-runs `docker run nipreps/mriqc:<version>` to perform MRIQC,
-and returns a zip of the results.
+It performs the following steps:
+  1. Saves and unzips the uploaded BIDS ZIP to /tmp/mriqc_upload.
+  2. Dynamically finds the first directory (assumed to be the BIDS root).
+  3. Runs MRIQC inside a Docker container (using nipreps/mriqc:22.0.6).
+  4. Captures Docker stdout and stderr and writes them to mriqc_log.txt in /tmp/mriqc_output.
+  5. Zips the OUTPUT_FOLDER (which contains MRIQC outputs and the log) and returns it.
 """
 
 from flask import Flask, request, send_file, jsonify
@@ -24,43 +26,33 @@ app = Flask(__name__)
 UPLOAD_FOLDER = "/tmp/mriqc_upload"
 OUTPUT_FOLDER = "/tmp/mriqc_output"
 
-# Ensure these directories exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 @app.route("/run-mriqc", methods=["POST"])
 def run_mriqc():
-    """
-    Expects a POST with:
-      - 'bids_zip': The BIDS dataset as a ZIP file
-      - 'participant_label': The subject ID (optional, defaults to '01')
-
-    Returns a ZIP of MRIQC derivatives if successful.
-    """
-
-    # 1) Parse incoming form data
+    # Parse incoming form data
     bids_zip = request.files.get("bids_zip")
-    subj_id  = request.form.get("participant_label", "01")
+    subj_id = request.form.get("participant_label", "01")
 
     if not bids_zip:
         return jsonify({"error": "No BIDS zip provided"}), 400
 
-    # 2) Clean up old data
+    # Clean up old data
     shutil.rmtree(UPLOAD_FOLDER, ignore_errors=True)
     shutil.rmtree(OUTPUT_FOLDER, ignore_errors=True)
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-    # 3) Save the uploaded zip
+    # Save the uploaded zip
     zip_path = os.path.join(UPLOAD_FOLDER, "bids_data.zip")
     bids_zip.save(zip_path)
 
-    # 4) Unzip BIDS data
+    # Unzip BIDS data
     with zipfile.ZipFile(zip_path, 'r') as zf:
         zf.extractall(UPLOAD_FOLDER)
 
-    # 5) Dynamically find the first directory in UPLOAD_FOLDER
-    #    That is assumed to be our BIDS root
+    # Dynamically find the first directory in UPLOAD_FOLDER as the BIDS root
     bids_root = None
     for item in Path(UPLOAD_FOLDER).iterdir():
         if item.is_dir():
@@ -70,12 +62,12 @@ def run_mriqc():
     if not bids_root:
         return jsonify({"error": "No BIDS directory found after unzipping."}), 400
 
-    # 6) Run MRIQC in Docker
+    # Run MRIQC in Docker and capture logs
     cmd = [
         "docker", "run", "--rm",
-        "-v", f"{bids_root.absolute()}:/data:ro",   # mount BIDS as read-only
+        "-v", f"{bids_root.absolute()}:/data:ro",  # mount BIDS as read-only
         "-v", f"{Path(OUTPUT_FOLDER).absolute()}:/out",  # mount output folder
-        "nipreps/mriqc:22.0.6",  # or whichever version you use
+        "nipreps/mriqc:22.0.6",  # use MRIQC image; change version if needed
         "/data", "/out",
         "participant",
         "--participant_label", subj_id,
@@ -84,24 +76,30 @@ def run_mriqc():
 
     run_result = subprocess.run(cmd, capture_output=True, text=True)
 
+    # Write logs to a file
+    log_path = Path(OUTPUT_FOLDER) / "mriqc_log.txt"
+    with open(log_path, "w") as log_file:
+        log_file.write("=== MRIQC Docker Run Logs ===\n")
+        log_file.write(run_result.stdout)
+        log_file.write("\n=== Errors (if any) ===\n")
+        log_file.write(run_result.stderr)
+
     if run_result.returncode != 0:
         return jsonify({
             "error": "MRIQC failed",
             "stderr": run_result.stderr
         }), 500
 
-    # 7) Zip the OUTPUT_FOLDER to return
+    # Zip the OUTPUT_FOLDER (which now includes MRIQC outputs and the log file)
     result_zip_path = "/tmp/mriqc_results.zip"
     shutil.make_archive(
-        base_name=result_zip_path.replace(".zip",""),
+        base_name=result_zip_path.replace(".zip", ""),
         format="zip",
         root_dir=OUTPUT_FOLDER
     )
 
-    # 8) Send results as a file
     return send_file(result_zip_path, as_attachment=True)
 
-
 if __name__ == "__main__":
-    # Bind to 0.0.0.0:8000 so it's externally accessible
+    # Bind to 0.0.0.0 on port 8000 so it's externally accessible.
     app.run(host="0.0.0.0", port=8000)
