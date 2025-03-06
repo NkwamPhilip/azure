@@ -136,10 +136,9 @@ async def run_mriqc_process_ws():
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        encoding="utf-8",
-        bufsize=0
+        stderr=asyncio.subprocess.STDOUT
     )
+
     while True:
         line = await process.stdout.readline()
         if not line:
