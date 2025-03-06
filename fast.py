@@ -138,7 +138,7 @@ async def run_mriqc_process_ws():
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         encoding="utf-8",
-        bufsize=1
+        bufsize=0
     )
     while True:
         line = await process.stdout.readline()
