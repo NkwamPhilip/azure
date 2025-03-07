@@ -28,32 +28,36 @@ async def run_mriqc_endpoint(
 ):
     """
     Accepts a BIDS ZIP file and a participant label.
-    It saves and unzips the file, finds the BIDS root,
-    runs MRIQC in a Docker container (nipreps/mriqc:22.0.6),
+    Saves/unzips the file, finds BIDS root,
+    runs MRIQC via Docker with memory=15g, nprocs=8, etc.
     writes logs to a file, zips the output folder, and returns the ZIP.
     """
+
+    # 1) Read the uploaded file contents
     try:
         contents = await bids_zip.read()
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=400, detail="Failed to read uploaded file")
     
-    # Clean up previous data
+    # 2) Clean up previous data
     shutil.rmtree(UPLOAD_FOLDER, ignore_errors=True)
     shutil.rmtree(OUTPUT_FOLDER, ignore_errors=True)
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     
+    # 3) Save the uploaded zip
     zip_path = Path(UPLOAD_FOLDER) / "bids_data.zip"
     with open(zip_path, "wb") as f:
         f.write(contents)
     
+    # 4) Unzip the file
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall(UPLOAD_FOLDER)
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=400, detail="Failed to unzip file")
     
-    # Find first directory as BIDS root
+    # 5) Find the first directory as the BIDS root
     bids_root = None
     for item in Path(UPLOAD_FOLDER).iterdir():
         if item.is_dir():
@@ -62,22 +66,26 @@ async def run_mriqc_endpoint(
     if bids_root is None:
         return JSONResponse(content={"error": "No BIDS directory found after unzipping."}, status_code=400)
     
-    # Build MRIQC Docker command
+    # 6) Build the MRIQC Docker command with memory=15g, concurrency flags, etc.
     cmd = [
         "docker", "run", "--rm",
+        "--memory=15g", "--memory-swap=15g",  # same as your local command
         "-v", f"{bids_root.absolute()}:/data:ro",
         "-v", f"{Path(OUTPUT_FOLDER).absolute()}:/out",
-        "nipreps/mriqc:22.0.6",
+        "nipreps/mriqc:22.0.6",               # or 24.0.2 if desired
         "/data", "/out",
         "participant",
         "--participant_label", participant_label,
-        "-m", "T1w", "T2w", "bold"
+        "-m", "T1w", "T2w", "bold",           # or whichever modalities you want
+        "--nprocs", "8",
+        "--omp-nthreads", "1",
+        "--no-sub"
     ]
     
-    # Run MRIQC synchronously
+    # 7) Run MRIQC, capturing stdout/stderr
     result = subprocess.run(cmd, capture_output=True, text=True)
     
-    # Write logs to file
+    # 8) Write logs to a file
     log_path = Path(OUTPUT_FOLDER) / "mriqc_log.txt"
     with open(log_path, "w") as log_file:
         log_file.write("=== MRIQC Docker Run Logs ===\n")
@@ -88,9 +96,13 @@ async def run_mriqc_endpoint(
     if result.returncode != 0:
         return JSONResponse(content={"error": "MRIQC failed", "stderr": result.stderr}, status_code=500)
     
-    # Zip the OUTPUT_FOLDER
+    # 9) Zip the OUTPUT_FOLDER
     result_zip_path = "/tmp/mriqc_results.zip"
-    shutil.make_archive(base_name=result_zip_path.replace(".zip", ""), format="zip", root_dir=OUTPUT_FOLDER)
+    shutil.make_archive(
+        base_name=result_zip_path.replace(".zip", ""),
+        format="zip",
+        root_dir=OUTPUT_FOLDER
+    )
     
     return FileResponse(result_zip_path, filename="mriqc_results.zip")
 
@@ -119,31 +131,34 @@ manager = ConnectionManager()
 async def run_mriqc_process_ws():
     """
     Runs the MRIQC Docker command and streams its output line by line over the WebSocket.
-    Adjust the volumes and parameters as needed.
+    Updated with memory=15g, concurrency, etc.
     """
-    # Example: assume BIDS data is already in /tmp/mriqc_upload/bids_data
-    bids_dir = "/tmp/mriqc_upload/bids_data"  # Update as necessary
+    # Example: assume BIDS data is in /tmp/mriqc_upload/bids_data
+    bids_dir = "/tmp/mriqc_upload/bids_data"  # Adjust if needed
     cmd = [
         "docker", "run", "--rm",
+        "--memory=15g", "--memory-swap=15g",
         "-v", f"{bids_dir}:/data:ro",
         "-v", f"{Path(OUTPUT_FOLDER).absolute()}:/out",
         "nipreps/mriqc:22.0.6",
         "/data", "/out",
         "participant",
-        "--participant_label", "01",  # Hard-coded for example; parameterize as needed.
-        "-m", "T1w", "T2w", "bold"
+        "--participant_label", "01",   # Hard-coded example; param if needed
+        "-m", "T1w", "T2w", "bold",
+        "--nprocs", "8",
+        "--omp-nthreads", "1",
+        "--no-sub"
     ]
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT
     )
-
     while True:
         line = await process.stdout.readline()
         if not line:
             break
-        await manager.broadcast(line.strip())
+        await manager.broadcast(line.decode().strip())
     await process.wait()
     await manager.broadcast("MRIQC process completed.")
 
@@ -153,7 +168,7 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         await run_mriqc_process_ws()
         while True:
-            # Keep the connection alive (receive messages if needed)
+            # keep the connection alive
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
