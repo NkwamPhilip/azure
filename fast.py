@@ -67,21 +67,21 @@ async def run_mriqc_endpoint(
         return JSONResponse(content={"error": "No BIDS directory found after unzipping."}, status_code=400)
     
     # 6) Build the MRIQC Docker command with memory=15g, concurrency flags, etc.
+    bids_dir = "/tmp/mriqc_upload/bids_data"  # Adjust if needed
     cmd = [
         "docker", "run", "--rm",
-        "--memory=15g", "--memory-swap=15g",  # same as your local command
-        "-v", f"{bids_root.absolute()}:/data:ro",
+        "--memory=15g", "--memory-swap=15g",
+        "-v", f"{bids_dir}:/data:ro",
         "-v", f"{Path(OUTPUT_FOLDER).absolute()}:/out",
-        "nipreps/mriqc:22.0.6",               # or 24.0.2 if desired
+        "nipreps/mriqc:22.0.6",
         "/data", "/out",
         "participant",
-        "--participant_label", participant_label,
-        "-m", "T1w", "T2w", "bold",           # or whichever modalities you want
+        "--participant_label", "01",   # Hard-coded example; param if needed
+        "-m", "T1w", "T2w", "bold",
         "--nprocs", "8",
         "--omp-nthreads", "1",
         "--no-sub"
     ]
-    
     # 7) Run MRIQC, capturing stdout/stderr
     result = subprocess.run(cmd, capture_output=True, text=True)
     
