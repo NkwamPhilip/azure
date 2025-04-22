@@ -111,8 +111,8 @@ async def run_mriqc_endpoint(
         "participant",
         "--participant_label", participant_label,
         "-m", "T1w", "T2w", "bold",
-        "--nprocs", "8",
-        "--omp-nthreads", "1",
+        "--nprocs", "12",
+        "--omp-nthreads", "4",
         "--no-sub"
     ]
     print("DEBUG: MRIQC Docker command:")
