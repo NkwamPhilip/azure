@@ -127,20 +127,25 @@ async def run_mriqc_endpoint(
         # Build Docker command with dynamic resources
         cmd = [
             "docker", "run", "--rm",
-            f"--memory={mem_gb}g", f"--memory-swap={mem_gb}g",
-            f"--cpus={n_procs}",
-            "-v", f"{bids_root.absolute()}:/data:ro",
-            "-v", f"{Path(OUTPUT_FOLDER).absolute()}:/out",
+            "--memory=" + f"{mem_gb}g",
+            "--memory-swap=" + f"{mem_gb}g",
+            "--cpus=" + str(n_procs),
+            "-v", f"{UPLOAD_DIR}:/data:ro",
+            "-v", f"{OUTPUT_DIR}:/out",
             "nipreps/mriqc:22.0.6",
-            "/data", "/out",
-            "participant",
-            "--participant_label", participant_label,
-            "-m", *input_modalities,
-            "--nprocs", n_procs,
-            "--omp-nthreads", str(max(1, int(n_procs)//4)),  # Auto-scale threads
+            "/data", "/out", "participant",
+            "--participant_label", subject_id,
+            "-m", *modalities,
+            "--nprocs", str(n_procs),
+            "--omp-nthreads", str(omp_threads),
             "--no-sub",
             "--verbose-reports"
         ]
+        
+        # 🆕 Add session-id flag if provided
+        if session_id:
+            cmd += ["--session-id", session_id]
+
 
         logger.info(f"Running MRIQC with command: {' '.join(cmd)}")
 
