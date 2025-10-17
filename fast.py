@@ -32,8 +32,8 @@ async def health_check():
     return {
         "status": "ready", 
         "resources": {
-            "memory_gb": 64,
-            "cpus": 16,
+            "memory_gb": 16,
+            "cpus": 4,
             "disk_space": shutil.disk_usage("/").free // (2**30)
         }
     }
@@ -47,8 +47,8 @@ async def run_mriqc_endpoint(
     bids_zip: UploadFile = File(...),
     participant_label: str = Form("01"),
     modalities: str = Form("T1w"),
-    n_procs: str = Form("12"),
-    mem_gb: str = Form("48")
+    n_procs: str = Form("4"),
+    mem_gb: str = Form("16")
 ):
     """Process BIDS data with MRIQC using frontend-provided parameters"""
     
