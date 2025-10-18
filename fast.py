@@ -185,6 +185,29 @@ async def run_mriqc(
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 #########################################
+# Cleanup Endpoint
+#########################################
+
+@app.post("/cleanup")
+async def cleanup():
+    """Clean up temporary files after processing"""
+    try:
+        shutil.rmtree(UPLOAD_FOLDER, ignore_errors=True)
+        shutil.rmtree(OUTPUT_FOLDER, ignore_errors=True)
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+        
+        result_zip = Path("/tmp/mriqc_results.zip")
+        if result_zip.exists():
+            result_zip.unlink()
+        
+        logger.info("✅ Cleanup completed")
+        return {"status": "cleaned"}
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+#########################################
 # Helper Functions
 #########################################
 
