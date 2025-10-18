@@ -53,8 +53,8 @@ async def submit_job(
     participant_label: str = Form("01"),
     modalities: str = Form("T1w"),
     session_id: str = Form("baseline"),
-    n_procs: str = Form("4"),
-    mem_gb: str = Form("16")
+    n_procs: str = Form("16"),
+    mem_gb: str = Form("64")
 ):
     """Submit a new MRIQC job"""
     
@@ -77,24 +77,80 @@ async def submit_job(
     }
     
     try:
-        # Save and extract BIDS zip
+        # Log upload info
+        logger.info(f"[{job_id}] Received file upload: filename={bids_zip.filename}, content_type={bids_zip.content_type}")
+        
+        # Save BIDS zip
         zip_path = job_dir / "bids_input.zip"
+        content = await bids_zip.read()
+        
+        if len(content) == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        
+        logger.info(f"[{job_id}] Read {len(content)} bytes from upload")
+        
         with open(zip_path, "wb") as f:
-            content = await bids_zip.read()
             f.write(content)
         
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(bids_data_dir)
+        if not zip_path.exists():
+            raise HTTPException(status_code=500, detail="Failed to save uploaded file")
         
-        logger.info(f"BIDS data extracted for job {job_id}")
+        actual_size = zip_path.stat().st_size
+        logger.info(f"[{job_id}] ZIP file saved: {zip_path} (size: {actual_size} bytes)")
+        
+        if actual_size != len(content):
+            logger.warning(f"[{job_id}] Size mismatch! Uploaded: {len(content)}, Saved: {actual_size}")
+        
+        # Extract with detailed logging
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                file_list = zf.namelist()
+                logger.info(f"[{job_id}] ZIP contains {len(file_list)} files")
+                if file_list:
+                    logger.info(f"[{job_id}] First 10 files: {file_list[:10]}")
+                else:
+                    logger.error(f"[{job_id}] ZIP file has no files!")
+                    raise HTTPException(status_code=400, detail="ZIP file is empty")
+                
+                logger.info(f"[{job_id}] Extracting to {bids_data_dir}")
+                zf.extractall(bids_data_dir)
+                
+        except zipfile.BadZipFile as e:
+            logger.error(f"[{job_id}] Invalid ZIP file: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid ZIP file format: {e}")
+        
+        # Verify extraction
+        extracted_items = list(bids_data_dir.iterdir())
+        logger.info(f"[{job_id}] Extracted {len(extracted_items)} items to {bids_data_dir}")
+        
+        if extracted_items:
+            logger.info(f"[{job_id}] Top-level items: {[item.name for item in extracted_items[:20]]}")
+        else:
+            logger.error(f"[{job_id}] ZIP extraction resulted in empty directory!")
+            raise HTTPException(status_code=400, detail="ZIP file appears to be empty after extraction")
+        
+        logger.info(f"[{job_id}] BIDS data extracted successfully")
         
         # Find BIDS root
         bids_root = find_bids_root(bids_data_dir)
         if not bids_root:
-            raise HTTPException(status_code=400, detail="No valid BIDS dataset found")
+            logger.error(f"[{job_id}] No valid BIDS dataset found (missing dataset_description.json)")
+            logger.info(f"[{job_id}] Searching in: {bids_data_dir}")
+            # Log directory structure for debugging
+            for root, dirs, files in os.walk(bids_data_dir):
+                level = root.replace(str(bids_data_dir), '').count(os.sep)
+                indent = ' ' * 2 * level
+                logger.info(f"[{job_id}] {indent}{os.path.basename(root)}/")
+                subindent = ' ' * 2 * (level + 1)
+                for file in files[:5]:  # Show first 5 files per directory
+                    logger.info(f"[{job_id}] {subindent}{file}")
+            raise HTTPException(status_code=400, detail="No valid BIDS dataset found (missing dataset_description.json)")
+        
+        logger.info(f"[{job_id}] Found BIDS root at: {bids_root}")
         
         # Parse modalities
         modality_list = modalities.split()
+        logger.info(f"[{job_id}] Processing modalities: {modality_list}")
         
         # Build Docker command
         cmd = [
@@ -115,7 +171,7 @@ async def submit_job(
         if session_id and session_id.lower() != "baseline":
             cmd += ["--session-id", session_id]
         
-        logger.info(f"Running MRIQC for job {job_id}: {' '.join(cmd)}")
+        logger.info(f"[{job_id}] Running MRIQC: {' '.join(cmd)}")
         
         # Run MRIQC in background
         asyncio.create_task(run_mriqc_async(job_id, cmd, mriqc_output_dir))
@@ -126,8 +182,11 @@ async def submit_job(
             "message": "MRIQC job started"
         })
         
+    except HTTPException:
+        jobs[job_id]["status"] = "failed"
+        raise
     except Exception as e:
-        logger.error(f"Unexpected error processing job {job_id}: {e}")
+        logger.exception(f"[{job_id}] Unexpected error processing job")
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -139,6 +198,8 @@ async def submit_job(
 async def run_mriqc_async(job_id: str, cmd: list, output_dir: Path):
     """Run MRIQC command asynchronously"""
     try:
+        logger.info(f"[{job_id}] Starting MRIQC Docker container...")
+        
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -156,16 +217,19 @@ async def run_mriqc_async(job_id: str, cmd: list, output_dir: Path):
             f.write("\n=== STDERR ===\n")
             f.write(stderr.decode())
         
+        logger.info(f"[{job_id}] MRIQC process exited with code {process.returncode}")
+        
         if process.returncode == 0:
             jobs[job_id]["status"] = "complete"
-            logger.info(f"Job {job_id} completed successfully")
+            logger.info(f"[{job_id}] Job completed successfully")
         else:
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["error"] = f"MRIQC exited with code {process.returncode}"
-            logger.error(f"Job {job_id} failed with return code {process.returncode}")
+            logger.error(f"[{job_id}] Job failed with return code {process.returncode}")
+            logger.error(f"[{job_id}] STDERR (last 1000 chars): {stderr.decode()[-1000:]}")
             
     except Exception as e:
-        logger.exception(f"Error running MRIQC for job {job_id}")
+        logger.exception(f"[{job_id}] Error running MRIQC")
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
 
@@ -240,20 +304,33 @@ def find_bids_root(upload_dir: Path) -> Optional[Path]:
     """Find BIDS root by looking for dataset_description.json"""
     from collections import deque
     
+    logger.info(f"Searching for BIDS root starting from: {upload_dir}")
     queue = deque([upload_dir])
+    visited = set()
     
     while queue:
         current = queue.popleft()
-        if (current / "dataset_description.json").exists():
+        
+        if current in visited:
+            continue
+        visited.add(current)
+        
+        # Check if this directory has dataset_description.json
+        desc_file = current / "dataset_description.json"
+        if desc_file.exists():
+            logger.info(f"Found BIDS root at: {current}")
             return current
         
+        # Add subdirectories to queue
         try:
             for child in current.iterdir():
                 if child.is_dir() and not child.name.startswith('.'):
                     queue.append(child)
         except PermissionError:
+            logger.warning(f"Permission denied accessing: {current}")
             continue
     
+    logger.error(f"No dataset_description.json found under {upload_dir}")
     return None
 
 #########################################
@@ -266,7 +343,6 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_text()
-            # Echo or handle real-time updates
             await websocket.send_text(f"Received: {data}")
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
