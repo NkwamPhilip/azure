@@ -18,7 +18,7 @@ logger = logging.getLogger("MRIQC-Backend")
 
 app = FastAPI()
 
-# Configure directories
+# Configure directories (mounted from host via docker-compose)
 UPLOAD_FOLDER = "/tmp/mriqc_upload"
 OUTPUT_FOLDER = "/tmp/mriqc_output"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
