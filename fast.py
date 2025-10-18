@@ -1,354 +1,224 @@
-import asyncio
-import shutil
-import subprocess
-import zipfile
-import uuid
+# main.py
 import os
+import uuid
+import shutil
+import zipfile
+import asyncio
+import json
 from pathlib import Path
-from typing import Dict, Optional
-import logging
+from typing import Optional, Dict
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# Optional Redis import (installed in Dockerfile)
+USE_REDIS = os.getenv("USE_REDIS", "true").lower() in ("1", "true", "yes")
+
+rdb = None
+if USE_REDIS:
+    try:
+        import redis  # type: ignore
+        REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+        REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+        rdb = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+        rdb.ping()
+        print(f"[main] Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+    except Exception as e:
+        print(f"[main] Warning: cannot connect to Redis: {e}. Falling back to in-memory tracking.")
+        rdb = None
+        USE_REDIS = False
+
+app = FastAPI(title="MRIQC Backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-logger = logging.getLogger("MRIQC-Backend")
 
-app = FastAPI()
+# Persistent directories (mount these from docker-compose)
+BASE_DIR = Path(os.getenv("MNT_BASE", "/mnt"))
+UPLOAD_ROOT = BASE_DIR / "mriqc_upload"
+OUTPUT_ROOT = BASE_DIR / "mriqc_output"
+RESULT_ROOT = BASE_DIR / "mriqc_results"
 
-# Job storage - keeps track of all jobs
-jobs: Dict[str, dict] = {}
+for p in (UPLOAD_ROOT, OUTPUT_ROOT, RESULT_ROOT):
+    p.mkdir(parents=True, exist_ok=True)
 
-# Base directory for all jobs
-JOBS_FOLDER = "/tmp/mriqc_jobs"
-os.makedirs(JOBS_FOLDER, exist_ok=True)
+# in-memory fallback storage
+_jobs: Dict[str, Dict] = {}
 
-#########################################
-# Health Check
-#########################################
+# ---------- helper functions for job status tracking ----------
+def set_status(job_id: str, status: dict):
+    key = f"mriqc:{job_id}"
+    if USE_REDIS and rdb:
+        rdb.set(key, json.dumps(status))
+    else:
+        _jobs[job_id] = status
 
+def get_status(job_id: str):
+    key = f"mriqc:{job_id}"
+    if USE_REDIS and rdb:
+        raw = rdb.get(key)
+        return json.loads(raw) if raw else None
+    return _jobs.get(job_id)
+
+def clear_status(job_id: str):
+    key = f"mriqc:{job_id}"
+    if USE_REDIS and rdb:
+        rdb.delete(key)
+    else:
+        _jobs.pop(job_id, None)
+
+# ---------- HTTP endpoints ----------
 @app.get("/health")
-async def health_check():
-    return {
-        "status": "ready",
-        "resources": {
-            "memory_gb": 64,
-            "cpus": 16,
-            "disk_space": shutil.disk_usage("/").free // (2**30)
-        }
-    }
-
-#########################################
-# Job Submission
-#########################################
+def health():
+    """Simple health check"""
+    return {"status": "ok"}
 
 @app.post("/submit-job")
 async def submit_job(
     bids_zip: UploadFile = File(...),
-    participant_label: str = Form("01"),
-    modalities: str = Form("T1w"),
+    participant_label: str = Form(...),
+    modalities: str = Form(...),
     session_id: str = Form("baseline"),
-    n_procs: str = Form("16"),
-    mem_gb: str = Form("64")
+    n_procs: int = Form(12),
+    mem_gb: int = Form(48),
 ):
-    """Submit a new MRIQC job"""
-    
-    job_id = str(uuid.uuid4())
-    job_dir = Path(JOBS_FOLDER) / job_id
-    bids_data_dir = job_dir / "bids_data"
-    mriqc_output_dir = job_dir / "mriqc_output"
-    
-    # Create directories
-    bids_data_dir.mkdir(parents=True, exist_ok=True)
-    mriqc_output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Initialize job status
-    jobs[job_id] = {
-        "status": "processing",
-        "job_id": job_id,
-        "participant_label": participant_label,
-        "modalities": modalities,
-        "session_id": session_id
-    }
-    
+    """
+    Receive a BIDS ZIP and start MRIQC as an async background task.
+    Return a job_id that the client can poll with /job-status/{job_id}
+    """
+    # Basic validation
+    if not participant_label:
+        raise HTTPException(status_code=400, detail="participant_label required")
+
+    job_id = str(uuid.uuid4())[:8]
+    job_upload_dir = UPLOAD_ROOT / job_id
+    job_upload_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = job_upload_dir / "bids_dataset.zip"
+
+    # Save uploaded zip
     try:
-        # Log upload info
-        logger.info(f"[{job_id}] Received file upload: filename={bids_zip.filename}, content_type={bids_zip.content_type}")
-        
-        # Save BIDS zip
-        zip_path = job_dir / "bids_input.zip"
-        content = await bids_zip.read()
-        
-        if len(content) == 0:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty")
-        
-        logger.info(f"[{job_id}] Read {len(content)} bytes from upload")
-        
-        with open(zip_path, "wb") as f:
-            f.write(content)
-        
-        if not zip_path.exists():
-            raise HTTPException(status_code=500, detail="Failed to save uploaded file")
-        
-        actual_size = zip_path.stat().st_size
-        logger.info(f"[{job_id}] ZIP file saved: {zip_path} (size: {actual_size} bytes)")
-        
-        if actual_size != len(content):
-            logger.warning(f"[{job_id}] Size mismatch! Uploaded: {len(content)}, Saved: {actual_size}")
-        
-        # Extract with detailed logging
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                file_list = zf.namelist()
-                logger.info(f"[{job_id}] ZIP contains {len(file_list)} files")
-                if file_list:
-                    logger.info(f"[{job_id}] First 10 files: {file_list[:10]}")
-                else:
-                    logger.error(f"[{job_id}] ZIP file has no files!")
-                    raise HTTPException(status_code=400, detail="ZIP file is empty")
-                
-                logger.info(f"[{job_id}] Extracting to {bids_data_dir}")
-                zf.extractall(bids_data_dir)
-                
-        except zipfile.BadZipFile as e:
-            logger.error(f"[{job_id}] Invalid ZIP file: {e}")
-            raise HTTPException(status_code=400, detail=f"Invalid ZIP file format: {e}")
-        
-        # Verify extraction
-        extracted_items = list(bids_data_dir.iterdir())
-        logger.info(f"[{job_id}] Extracted {len(extracted_items)} items to {bids_data_dir}")
-        
-        if extracted_items:
-            logger.info(f"[{job_id}] Top-level items: {[item.name for item in extracted_items[:20]]}")
-        else:
-            logger.error(f"[{job_id}] ZIP extraction resulted in empty directory!")
-            raise HTTPException(status_code=400, detail="ZIP file appears to be empty after extraction")
-        
-        logger.info(f"[{job_id}] BIDS data extracted successfully")
-        
-        # Find BIDS root
-        bids_root = find_bids_root(bids_data_dir)
-        if not bids_root:
-            logger.error(f"[{job_id}] No valid BIDS dataset found (missing dataset_description.json)")
-            logger.info(f"[{job_id}] Searching in: {bids_data_dir}")
-            # Log directory structure for debugging
-            for root, dirs, files in os.walk(bids_data_dir):
-                level = root.replace(str(bids_data_dir), '').count(os.sep)
-                indent = ' ' * 2 * level
-                logger.info(f"[{job_id}] {indent}{os.path.basename(root)}/")
-                subindent = ' ' * 2 * (level + 1)
-                for file in files[:5]:  # Show first 5 files per directory
-                    logger.info(f"[{job_id}] {subindent}{file}")
-            raise HTTPException(status_code=400, detail="No valid BIDS dataset found (missing dataset_description.json)")
-        
-        logger.info(f"[{job_id}] Found BIDS root at: {bids_root}")
-        
-        # Parse modalities
-        modality_list = modalities.split()
-        logger.info(f"[{job_id}] Processing modalities: {modality_list}")
-        
-        # Build Docker command
-        cmd = [
+        with open(zip_path, "wb") as out_f:
+            while True:
+                chunk = await bids_zip.read(1024 * 1024)
+                if not chunk:
+                    break
+                out_f.write(chunk)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save upload: {e}")
+
+    # Extract
+    try:
+        extract_dir = job_upload_dir / "bids"
+        extract_dir.mkdir(exist_ok=True)
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(extract_dir)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Invalid ZIP file")
+
+    # Set pending status and start background MRIQC process
+    set_status(job_id, {"status": "pending", "result": None})
+    output_dir = OUTPUT_ROOT / job_id
+    asyncio.create_task(run_mriqc_job(job_id, extract_dir, output_dir, participant_label, modalities, n_procs, mem_gb, session_id))
+    return {"job_id": job_id}
+
+@app.get("/job-status/{job_id}")
+def job_status(job_id: str):
+    s = get_status(job_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Job ID not found")
+    return s
+
+@app.get("/download/{job_id}")
+def download_result(job_id: str):
+    result_zip = RESULT_ROOT / f"{job_id}.zip"
+    if not result_zip.exists():
+        raise HTTPException(status_code=404, detail="Result not ready or not found")
+    return FileResponse(result_zip, filename=f"mriqc_results_{job_id}.zip", media_type="application/zip")
+
+@app.delete("/delete-job/{job_id}")
+def delete_job(job_id: str):
+    """
+    Delete upload, output and packaged result for a job (called after user downloads).
+    """
+    try:
+        shutil.rmtree(UPLOAD_ROOT / job_id, ignore_errors=True)
+        shutil.rmtree(OUTPUT_ROOT / job_id, ignore_errors=True)
+        result_zip = RESULT_ROOT / f"{job_id}.zip"
+        if result_zip.exists():
+            result_zip.unlink()
+        clear_status(job_id)
+        return {"status": "deleted"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# ---------- MRIQC runner ----------
+async def run_mriqc_job(job_id: str, bids_dir: Path, output_dir: Path,
+                        participant_label: str, modalities: str,
+                        n_procs: int, mem_gb: int, session_id: str):
+    """
+    Launch MRIQC in Docker. Important:
+      - docker *options* go BEFORE the image name
+      - MRIQC CLI args (like --session-id) go AFTER the image name
+    """
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build docker command
+        docker_options = [
             "docker", "run", "--rm",
-            f"--memory={mem_gb}g",
-            f"--cpus={n_procs}",
-            "-v", f"{bids_root}:/data:ro",
-            "-v", f"{mriqc_output_dir}:/out",
+            "--memory", f"{mem_gb}g",
+            "--memory-swap", f"{mem_gb}g",
+            "--cpus", str(n_procs),
+            "-v", f"{str(bids_dir)}:/data:ro",
+            "-v", f"{str(output_dir)}:/out",
+        ]
+
+        # Image + MRIQC CLI args (MRIQC flags go after image)
+        image_and_args = [
             "nipreps/mriqc:22.0.6",
             "/data", "/out", "participant",
             "--participant_label", participant_label,
-            "-m", *modality_list,
-            "--nprocs", n_procs,
-            "--no-sub",
-            "--verbose-reports"
         ]
-        
-        if session_id and session_id.lower() != "baseline":
-            cmd += ["--session-id", session_id]
-        
-        logger.info(f"[{job_id}] Running MRIQC: {' '.join(cmd)}")
-        
-        # Run MRIQC in background
-        asyncio.create_task(run_mriqc_async(job_id, cmd, mriqc_output_dir))
-        
-        return JSONResponse({
-            "job_id": job_id,
-            "status": "processing",
-            "message": "MRIQC job started"
-        })
-        
-    except HTTPException:
-        jobs[job_id]["status"] = "failed"
-        raise
+
+        # modalitiy tokens: MRIQC expects -m MODE1 MODE2 ...
+        if modalities:
+            modality_tokens = modalities.strip().split()
+            image_and_args += ["-m"] + modality_tokens
+
+        image_and_args += [
+            "--nprocs", str(n_procs),
+            "--omp-nthreads", "4",
+            "--no-sub",
+            "--verbose-reports",
+            "--session-id", session_id
+        ]
+
+        cmd = docker_options + image_and_args
+
+        set_status(job_id, {"status": "running"})
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            # capture stderr and mark failed
+            set_status(job_id, {"status": "failed", "error": stderr.decode()})
+            return
+
+        # Package outputs into results zip
+        zip_path = RESULT_ROOT / f"{job_id}.zip"
+        shutil.make_archive(str(zip_path).replace(".zip", ""), 'zip', root_dir=output_dir)
+        set_status(job_id, {"status": "complete", "result": str(zip_path)})
+
     except Exception as e:
-        logger.exception(f"[{job_id}] Unexpected error processing job")
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = str(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        set_status(job_id, {"status": "failed", "error": str(e)})
 
-#########################################
-# Background Task Runner
-#########################################
-
-async def run_mriqc_async(job_id: str, cmd: list, output_dir: Path):
-    """Run MRIQC command asynchronously"""
-    try:
-        logger.info(f"[{job_id}] Starting MRIQC Docker container...")
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        stdout, stderr = await process.communicate()
-        
-        # Save logs
-        log_path = output_dir / "mriqc_log.txt"
-        with open(log_path, "w") as f:
-            f.write(f"Command: {' '.join(cmd)}\n\n")
-            f.write("=== STDOUT ===\n")
-            f.write(stdout.decode())
-            f.write("\n=== STDERR ===\n")
-            f.write(stderr.decode())
-        
-        logger.info(f"[{job_id}] MRIQC process exited with code {process.returncode}")
-        
-        if process.returncode == 0:
-            jobs[job_id]["status"] = "complete"
-            logger.info(f"[{job_id}] Job completed successfully")
-        else:
-            jobs[job_id]["status"] = "failed"
-            jobs[job_id]["error"] = f"MRIQC exited with code {process.returncode}"
-            logger.error(f"[{job_id}] Job failed with return code {process.returncode}")
-            logger.error(f"[{job_id}] STDERR (last 1000 chars): {stderr.decode()[-1000:]}")
-            
-    except Exception as e:
-        logger.exception(f"[{job_id}] Error running MRIQC")
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = str(e)
-
-#########################################
-# Job Status
-#########################################
-
-@app.get("/job-status/{job_id}")
-async def get_job_status(job_id: str):
-    """Check the status of a job"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    return JSONResponse(jobs[job_id])
-
-#########################################
-# Download Results
-#########################################
-
-@app.get("/download/{job_id}")
-async def download_results(job_id: str):
-    """Download MRIQC results as a zip file"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    if jobs[job_id]["status"] != "complete":
-        raise HTTPException(status_code=400, detail="Job not complete")
-    
-    job_dir = Path(JOBS_FOLDER) / job_id
-    output_dir = job_dir / "mriqc_output"
-    
-    if not output_dir.exists():
-        raise HTTPException(status_code=404, detail="Results not found")
-    
-    # Create zip
-    zip_path = job_dir / "results.zip"
-    shutil.make_archive(
-        str(zip_path.with_suffix("")),
-        'zip',
-        root_dir=output_dir
-    )
-    
-    return FileResponse(
-        zip_path,
-        filename=f"mriqc_results_{job_id}.zip",
-        media_type="application/zip"
-    )
-
-#########################################
-# Cleanup Job
-#########################################
-
-@app.delete("/delete-job/{job_id}")
-async def delete_job(job_id: str):
-    """Delete job data from server"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job_dir = Path(JOBS_FOLDER) / job_id
-    if job_dir.exists():
-        shutil.rmtree(job_dir)
-    
-    del jobs[job_id]
-    
-    return JSONResponse({"message": f"Job {job_id} deleted"})
-
-#########################################
-# Helper Functions
-#########################################
-
-def find_bids_root(upload_dir: Path) -> Optional[Path]:
-    """Find BIDS root by looking for dataset_description.json"""
-    from collections import deque
-    
-    logger.info(f"Searching for BIDS root starting from: {upload_dir}")
-    queue = deque([upload_dir])
-    visited = set()
-    
-    while queue:
-        current = queue.popleft()
-        
-        if current in visited:
-            continue
-        visited.add(current)
-        
-        # Check if this directory has dataset_description.json
-        desc_file = current / "dataset_description.json"
-        if desc_file.exists():
-            logger.info(f"Found BIDS root at: {current}")
-            return current
-        
-        # Add subdirectories to queue
-        try:
-            for child in current.iterdir():
-                if child.is_dir() and not child.name.startswith('.'):
-                    queue.append(child)
-        except PermissionError:
-            logger.warning(f"Permission denied accessing: {current}")
-            continue
-    
-    logger.error(f"No dataset_description.json found under {upload_dir}")
-    return None
-
-#########################################
-# WebSocket (Optional)
-#########################################
-
-@app.websocket("/ws/mriqc")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        while True:
-            data = await websocket.receive_text()
-            await websocket.send_text(f"Received: {data}")
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-
+# Run with: uvicorn main:app --host 0.0.0.0 --port 8000
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
