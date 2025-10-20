@@ -49,7 +49,7 @@ async def run_mriqc(
     participant_label: str = Form("01"),
     modalities: str = Form("T1w"),
     session_id: str = Form("baseline"),
-    n_procs: str = Form("8"),
+    n_procs: str = Form("4"),
     mem_gb: str = Form("16")
 ):
     """Run MRIQC directly and return results when complete"""
