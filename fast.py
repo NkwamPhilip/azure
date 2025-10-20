@@ -8,6 +8,7 @@ import zipfile
 from typing import Optional
 from collections import deque
 import logging
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -18,7 +19,7 @@ logger = logging.getLogger("MRIQC-Backend")
 
 app = FastAPI()
 
-# Configure directories (mounted from host via docker-compose)
+# Configure directories (these are mounted from host)
 UPLOAD_FOLDER = "/tmp/mriqc_upload"
 OUTPUT_FOLDER = "/tmp/mriqc_output"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -32,15 +33,11 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 async def health_check():
     return {
         "status": "ready",
-        "resources": {
-            "memory_gb": 16,
-            "cpus": 4,
-            "disk_space": shutil.disk_usage("/").free // (2**30)
-        }
+        "message": "MRIQC backend with Docker-in-Docker"
     }
 
 #########################################
-# Direct MRIQC Execution Endpoint
+# MRIQC Execution Endpoint
 #########################################
 
 @app.post("/run-mriqc")
@@ -48,11 +45,11 @@ async def run_mriqc(
     bids_zip: UploadFile = File(...),
     participant_label: str = Form("01"),
     modalities: str = Form("T1w"),
-    session_id: str = Form("baseline"),
+    session_id: str = Form(""),
     n_procs: str = Form("4"),
     mem_gb: str = Form("16")
 ):
-    """Run MRIQC directly and return results when complete"""
+    """Run MRIQC using Docker container"""
     
     try:
         # Validate inputs
@@ -92,6 +89,7 @@ async def run_mriqc(
         # Find BIDS root directory
         bids_root = find_bids_root(Path(UPLOAD_FOLDER))
         if not bids_root:
+            debug_structure(UPLOAD_FOLDER)
             raise HTTPException(
                 status_code=400,
                 detail="No valid BIDS dataset found (missing dataset_description.json)"
@@ -99,32 +97,21 @@ async def run_mriqc(
 
         logger.info(f"[{participant_label}] BIDS root: {bids_root}")
 
+        # Debug: Show actual file structure
+        debug_structure(str(bids_root))
+
         # Parse modalities
         modality_list = modalities.split()
         logger.info(f"[{participant_label}] Modalities: {modality_list}")
 
-        # PRE-CHECK: Verify Docker image exists locally
-        try:
-            check_image = subprocess.run(
-                ["docker", "image", "inspect", "nipreps/mriqc:22.0.6"],
-                capture_output=True,
-                timeout=30
-            )
-            if check_image.returncode != 0:
-                logger.error("Docker image nipreps/mriqc:22.0.6 not found locally")
-                raise HTTPException(
-                    status_code=500,
-                    detail="MRIQC Docker image not available. Please run: docker pull nipreps/mriqc:22.0.6 on the server"
-                )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=500, detail="Docker check timed out")
-
-        # Build Docker command
+        # Build Docker command with proper volume mounts
+        # CRITICAL: Use the same paths that are mounted from host
         cmd = [
             "docker", "run", "--rm",
             f"--memory={mem_gb}g",
             f"--cpus={n_procs}",
-            "-v", f"{bids_root}:/data",
+            # Mount the same directories that the host mounted to this container
+            "-v", f"{bids_root}:/data:ro",
             "-v", f"{OUTPUT_FOLDER}:/out",
             "nipreps/mriqc:22.0.6",
             "/data", "/out", "participant",
@@ -135,18 +122,28 @@ async def run_mriqc(
             "--verbose-reports"
         ]
         
-        if session_id:
-            cmd += ["--session-id", session_id]
+        # Handle session ID - convert to lowercase for BIDS compatibility
+        if session_id and session_id.strip():
+            session_id_lower = session_id.strip().lower()
+            cmd += ["--session-id", session_id_lower]
+            logger.info(f"[{participant_label}] Using session ID: {session_id_lower}")
 
-        logger.info(f"[{participant_label}] Running: {' '.join(cmd)}")
+        logger.info(f"[{participant_label}] Running Docker command: {' '.join(cmd)}")
 
-        # Execute MRIQC synchronously
+        # Pre-pull the MRIQC image to ensure it's available
+        pull_cmd = ["docker", "pull", "nipreps/mriqc:22.0.6"]
+        logger.info(f"[{participant_label}] Pulling MRIQC image...")
+        pull_result = subprocess.run(pull_cmd, capture_output=True, text=True)
+        if pull_result.returncode != 0:
+            logger.warning(f"[{participant_label}] Failed to pull image, using local if available: {pull_result.stderr}")
+
+        # Execute MRIQC in Docker
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=7200
+                timeout=7200  # 2 hour timeout
             )
         except subprocess.TimeoutExpired:
             logger.error(f"[{participant_label}] Timed out after 2 hours")
@@ -163,18 +160,31 @@ async def run_mriqc(
 
         if result.returncode != 0:
             logger.error(f"[{participant_label}] Failed with code {result.returncode}")
-            logger.error(f"[{participant_label}] STDERR: {result.stderr[-1000:]}")
-            # Return detailed error to frontend
-            raise HTTPException(
-                status_code=500,
-                detail=f"MRIQC processing failed. Check if Docker image exists and volumes are mounted correctly. Error: {result.stderr[-300:]}"
-            )
+            logger.error(f"[{participant_label}] STDERR: {result.stderr}")
+            
+            # Enhanced error handling for file not found issues
+            if "got an empty result" in result.stderr:
+                # Debug the actual file structure that MRIQC should see
+                debug_mriqc_view(bids_root, participant_label, session_id)
+                error_msg = f"MRIQC cannot find files. Expected structure: /data/sub-{participant_label}/[ses-*/]anat/sub-{participant_label}[_ses-*]_T1w.nii.gz"
+            else:
+                error_msg = f"MRIQC failed: {result.stderr[-1000:]}"
+                
+            raise HTTPException(status_code=500, detail=error_msg)
 
         logger.info(f"[{participant_label}] ✅ MRIQC completed successfully")
+
+        # Check if results were generated
+        result_files = list(Path(OUTPUT_FOLDER).rglob("*"))
+        if not result_files:
+            raise HTTPException(status_code=500, detail="MRIQC completed but no output files were generated")
+
+        logger.info(f"[{participant_label}] Found {len(result_files)} result files")
 
         # Package results
         result_zip_path = "/tmp/mriqc_results.zip"
         
+        # Remove old zip if exists
         if Path(result_zip_path).exists():
             Path(result_zip_path).unlink()
         
@@ -193,12 +203,7 @@ async def run_mriqc(
         return FileResponse(
             result_zip_path,
             filename=f"mriqc_results_{participant_label}.zip",
-            media_type="application/zip",
-            headers={
-                "X-MRIQC-Status": "complete",
-                "X-MRIQC-Participant": participant_label,
-                "Content-Length": str(zip_size)
-            }
+            media_type="application/zip"
         )
 
     except HTTPException:
@@ -206,28 +211,6 @@ async def run_mriqc(
     except Exception as e:
         logger.exception(f"[{participant_label}] Unexpected error")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-#########################################
-# Cleanup Endpoint
-#########################################
-
-@app.post("/cleanup")
-async def cleanup():
-    """Clean up temporary files after processing"""
-    try:
-        shutil.rmtree(UPLOAD_FOLDER, ignore_errors=True)
-        shutil.rmtree(OUTPUT_FOLDER, ignore_errors=True)
-        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-        os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-        
-        result_zip = Path("/tmp/mriqc_results.zip")
-        if result_zip.exists():
-            result_zip.unlink()
-        
-        logger.info("✅ Cleanup completed")
-        return {"status": "cleaned"}
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 #########################################
 # Helper Functions
@@ -256,6 +239,62 @@ def find_bids_root(upload_dir: Path) -> Optional[Path]:
             continue
     
     return None
+
+def debug_structure(root_path: str):
+    """Debug function to show actual file structure"""
+    logger.info("=== DEBUG: File Structure ===")
+    try:
+        for root, dirs, files in os.walk(root_path):
+            level = root.replace(root_path, '').count(os.sep)
+            indent = ' ' * 2 * level
+            logger.info(f"{indent}{os.path.basename(root)}/")
+            subindent = ' ' * 2 * (level + 1)
+            for file in files:
+                logger.info(f"{subindent}{file}")
+    except Exception as e:
+        logger.error(f"Debug structure failed: {e}")
+
+def debug_mriqc_view(bids_root: Path, participant_label: str, session_id: str):
+    """Debug what MRIQC should see"""
+    logger.info("=== DEBUG: MRIQC Expected View ===")
+    
+    # Check participant directory
+    participant_dir = bids_root / f"sub-{participant_label}"
+    if participant_dir.exists():
+        logger.info(f"✅ Found participant directory: {participant_dir}")
+        
+        # Check session directory
+        if session_id:
+            session_dir = participant_dir / f"ses-{session_id.lower()}"
+            if session_dir.exists():
+                logger.info(f"✅ Found session directory: {session_dir}")
+                # Check modality directories
+                for modality in ['anat', 'func', 'dwi']:
+                    modality_dir = session_dir / modality
+                    if modality_dir.exists():
+                        nifti_files = list(modality_dir.glob("*.nii*"))
+                        logger.info(f"✅ {modality_dir}: {len(nifti_files)} NIfTI files")
+                    else:
+                        logger.warning(f"❌ Missing modality directory: {modality_dir}")
+            else:
+                logger.warning(f"❌ Missing session directory: {session_dir}")
+                # List what sessions actually exist
+                actual_sessions = [d.name for d in participant_dir.iterdir() if d.is_dir() and d.name.startswith('ses-')]
+                logger.info(f"Actual sessions: {actual_sessions}")
+        else:
+            # No session - check directly in participant directory
+            for modality in ['anat', 'func', 'dwi']:
+                modality_dir = participant_dir / modality
+                if modality_dir.exists():
+                    nifti_files = list(modality_dir.glob("*.nii*"))
+                    logger.info(f"✅ {modality_dir}: {len(nifti_files)} NIfTI files")
+                else:
+                    logger.warning(f"❌ Missing modality directory: {modality_dir}")
+    else:
+        logger.error(f"❌ Missing participant directory: {participant_dir}")
+        # List what participants actually exist
+        actual_participants = [d.name for d in bids_root.iterdir() if d.is_dir() and d.name.startswith('sub-')]
+        logger.info(f"Actual participants: {actual_participants}")
 
 if __name__ == "__main__":
     import uvicorn
