@@ -103,6 +103,22 @@ async def run_mriqc(
         modality_list = modalities.split()
         logger.info(f"[{participant_label}] Modalities: {modality_list}")
 
+        # PRE-CHECK: Verify Docker image exists locally
+        try:
+            check_image = subprocess.run(
+                ["docker", "image", "inspect", "nipreps/mriqc:22.0.6"],
+                capture_output=True,
+                timeout=30
+            )
+            if check_image.returncode != 0:
+                logger.error("Docker image nipreps/mriqc:22.0.6 not found locally")
+                raise HTTPException(
+                    status_code=500,
+                    detail="MRIQC Docker image not available. Please run: docker pull nipreps/mriqc:22.0.6 on the server"
+                )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=500, detail="Docker check timed out")
+
         # Build Docker command
         cmd = [
             "docker", "run", "--rm",
@@ -124,13 +140,13 @@ async def run_mriqc(
 
         logger.info(f"[{participant_label}] Running: {' '.join(cmd)}")
 
-        # Execute MRIQC synchronously (blocks until complete)
+        # Execute MRIQC synchronously
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=7200  # 2 hour timeout
+                timeout=7200
             )
         except subprocess.TimeoutExpired:
             logger.error(f"[{participant_label}] Timed out after 2 hours")
@@ -148,9 +164,10 @@ async def run_mriqc(
         if result.returncode != 0:
             logger.error(f"[{participant_label}] Failed with code {result.returncode}")
             logger.error(f"[{participant_label}] STDERR: {result.stderr[-1000:]}")
+            # Return detailed error to frontend
             raise HTTPException(
                 status_code=500,
-                detail=f"MRIQC failed with code {result.returncode}: {result.stderr[-500:]}"
+                detail=f"MRIQC processing failed. Check if Docker image exists and volumes are mounted correctly. Error: {result.stderr[-300:]}"
             )
 
         logger.info(f"[{participant_label}] ✅ MRIQC completed successfully")
@@ -158,7 +175,6 @@ async def run_mriqc(
         # Package results
         result_zip_path = "/tmp/mriqc_results.zip"
         
-        # Remove old zip if exists
         if Path(result_zip_path).exists():
             Path(result_zip_path).unlink()
         
@@ -173,7 +189,6 @@ async def run_mriqc(
 
         zip_size = Path(result_zip_path).stat().st_size
         logger.info(f"[{participant_label}] Result ZIP created: {zip_size / (1024*1024):.2f} MB")
-        logger.info(f"[{participant_label}] Returning results ZIP")
 
         return FileResponse(
             result_zip_path,
@@ -191,7 +206,6 @@ async def run_mriqc(
     except Exception as e:
         logger.exception(f"[{participant_label}] Unexpected error")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
 #########################################
 # Cleanup Endpoint
 #########################################
