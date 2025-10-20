@@ -157,6 +157,11 @@ async def run_mriqc(
 
         # Package results
         result_zip_path = "/tmp/mriqc_results.zip"
+        
+        # Remove old zip if exists
+        if Path(result_zip_path).exists():
+            Path(result_zip_path).unlink()
+        
         shutil.make_archive(
             base_name=result_zip_path.replace(".zip", ""),
             format="zip",
@@ -166,6 +171,8 @@ async def run_mriqc(
         if not Path(result_zip_path).exists():
             raise HTTPException(status_code=500, detail="Failed to package results")
 
+        zip_size = Path(result_zip_path).stat().st_size
+        logger.info(f"[{participant_label}] Result ZIP created: {zip_size / (1024*1024):.2f} MB")
         logger.info(f"[{participant_label}] Returning results ZIP")
 
         return FileResponse(
@@ -174,7 +181,8 @@ async def run_mriqc(
             media_type="application/zip",
             headers={
                 "X-MRIQC-Status": "complete",
-                "X-MRIQC-Participant": participant_label
+                "X-MRIQC-Participant": participant_label,
+                "Content-Length": str(zip_size)
             }
         )
 
