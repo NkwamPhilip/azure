@@ -33,8 +33,8 @@ async def health_check():
     return {
         "status": "ready",
         "resources": {
-            "memory_gb": 64,
-            "cpus": 16,
+            "memory_gb": 16,
+            "cpus": 4,
             "disk_space": shutil.disk_usage("/").free // (2**30)
         }
     }
@@ -49,8 +49,8 @@ async def run_mriqc(
     participant_label: str = Form("01"),
     modalities: str = Form("T1w"),
     session_id: str = Form("baseline"),
-    n_procs: str = Form("16"),
-    mem_gb: str = Form("64")
+    n_procs: str = Form("8"),
+    mem_gb: str = Form("16")
 ):
     """Run MRIQC directly and return results when complete"""
     
